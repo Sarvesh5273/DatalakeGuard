@@ -1,6 +1,6 @@
 {
   "name": "DatalakeGuard",
-  "version": "0.0.1",
+  "version": "1.0.0",
   "private": true,
   "scripts": {
     "android": "react-native run-android",
@@ -10,8 +10,14 @@
     "test": "jest"
   },
   "dependencies": {
+    "@react-native-community/netinfo": "11.3.0",
     "react": "18.2.0",
-    "react-native": "0.73.8"
+    "react-native": "0.73.8",
+    "react-native-fs": "2.20.0",
+    "react-native-permissions": "4.1.5",
+    "react-native-quick-sqlite": "8.0.6",
+    "react-native-vision-camera": "3.9.2",
+    "zustand": "4.5.2"
   },
   "devDependencies": {
     "@babel/core": "^7.20.0",
