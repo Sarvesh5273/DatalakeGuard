@@ -34,6 +34,11 @@ class FaceAuthModule(reactContext: ReactApplicationContext) : ReactContextBaseJa
 
     override fun getName(): String = "FaceAuthModule"
 
+    // Required by RN's NativeEventEmitter — without these the emitter throws a warning
+    // and silently drops all events in the new architecture
+    @ReactMethod fun addListener(eventName: String) {}
+    @ReactMethod fun removeListeners(count: Int) {}
+
     @ReactMethod
     fun startEnrollment(workerId: String, promise: Promise) {
         enrollmentFrames.clear()
@@ -314,14 +319,11 @@ class FaceAuthModule(reactContext: ReactApplicationContext) : ReactContextBaseJa
         }
     }
 
-    @ReactMethod
-    fun stopLivenessCamera(promise: Promise) {
+        @ReactMethod
+        fun stopLivenessCamera() {
         livenessCameraManager?.stop()
         livenessCameraManager = null
-        promise.resolve(Arguments.createMap().apply {
-            putBoolean("success", true)
-            putString("message", "Liveness camera stopped")
-        })
+    
     }
 
     @ReactMethod

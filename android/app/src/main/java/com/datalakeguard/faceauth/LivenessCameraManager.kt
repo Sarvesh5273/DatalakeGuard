@@ -1,12 +1,16 @@
 package com.datalakeguard.faceauth
 
+import kotlin.math.pow
 import android.content.Context
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory          // ADD THIS
+import android.graphics.BitmapFactory
 import android.graphics.ImageFormat
 import android.graphics.Rect
 import android.graphics.YuvImage
 import android.media.Image
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import androidx.camera.core.*
 import androidx.camera.lifecycle.ProcessCameraProvider
@@ -31,71 +35,122 @@ class LivenessCameraManager(
     private var imageAnalysis: ImageAnalysis? = null
     private var cameraProvider: ProcessCameraProvider? = null
     private var isRunning = AtomicBoolean(false)
+    private var isStopped = false
 
-    // Frame history for blink detection
     private val earHistory = mutableListOf<Float>()
     private val maxHistorySize = 15
-    
-    // Store current frame for matching
     private var currentFrameBitmap: Bitmap? = null
 
     fun start() {
         if (isRunning.get()) return
+
+        if (ContextCompat.checkSelfPermission(context, android.Manifest.permission.CAMERA)
+            != PackageManager.PERMISSION_GRANTED) {
+            Log.e(TAG, "Camera permission not granted")
+            return
+        }
+
         isRunning.set(true)
+        isStopped = false
 
         val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
 
         cameraProviderFuture.addListener({
-            try {
-                cameraProvider = cameraProviderFuture.get()
-
-                imageAnalysis = ImageAnalysis.Builder()
-                    .setTargetResolution(android.util.Size(640, 480))
-                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                    .build()
-                    .also { analysis ->
-                        analysis.setAnalyzer(analysisExecutor) { imageProxy ->
-                            processFrame(imageProxy)
-                        }
-                    }
-
-                val cameraSelector = CameraSelector.DEFAULT_FRONT_CAMERA
-
-                cameraProvider?.unbindAll()
-                cameraProvider?.bindToLifecycle(
-                    lifecycleOwner,
-                    cameraSelector,
-                    imageAnalysis!!
-                )
-
-                Log.i(TAG, "CameraX liveness camera started")
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to start camera", e)
-                isRunning.set(false)
-            }
+            tryStartCameraWithRetry(0)
         }, ContextCompat.getMainExecutor(context))
     }
 
-    private fun processFrame(imageProxy: ImageProxy) {
+    private fun tryStartCameraWithRetry(retryCount: Int) {
+        if (!isRunning.get() || isStopped) return
+
+        try {
+            cameraProvider = ProcessCameraProvider.getInstance(context).get()
+
+            imageAnalysis = ImageAnalysis.Builder()
+                .setTargetResolution(android.util.Size(640, 480))
+                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .build()
+                .also { analysis ->
+                    analysis.setAnalyzer(analysisExecutor) { imageProxy ->
+                        processFrame(imageProxy)
+                    }
+                }
+
+            val cameraSelector = CameraSelector.DEFAULT_FRONT_CAMERA
+            val preview = Preview.Builder().build()
+            val surfaceTexture = CameraPreviewHolder.surfaceTexture
+
+            if (surfaceTexture == null) {
+                if (retryCount < 30) {
+                    Log.w(TAG, "SurfaceTexture not ready, retrying in 200ms... ($retryCount/30)")
+                    Handler(Looper.getMainLooper()).postDelayed({
+                        tryStartCameraWithRetry(retryCount + 1)
+                    }, 200)
+                    return
+                } else {
+                    Log.e(TAG, "SurfaceTexture never became ready after 30 retries")
+                    isRunning.set(false)
+                    return
+                }
+            }
+
+            val surfaceProvider = androidx.camera.core.Preview.SurfaceProvider { request ->
+                val texture = surfaceTexture ?: return@SurfaceProvider
+                val resolution = request.resolution
+                texture.setDefaultBufferSize(resolution.width, resolution.height)
+                val surface = android.view.Surface(texture)
+                request.provideSurface(surface, ContextCompat.getMainExecutor(context)) { result ->
+                    Log.d(TAG, "Surface result: $result")
+                }
+            }
+
+            preview.setSurfaceProvider(surfaceProvider)
+
+            cameraProvider?.unbindAll()
+            cameraProvider?.bindToLifecycle(
+                lifecycleOwner,
+                cameraSelector,
+                preview,
+                imageAnalysis!!
+            )
+
+            Log.i(TAG, "CameraX liveness camera started successfully with TextureView")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start camera", e)
+            isRunning.set(false)
+        }
+    }
+
+        private fun processFrame(imageProxy: ImageProxy) {
         try {
             val bitmap = imageProxy.toBitmap()
-            
-            // Store copy for matching
             currentFrameBitmap?.recycle()
             currentFrameBitmap = bitmap.copy(Bitmap.Config.ARGB_8888, false)
-            
-            val detection = tfliteEngine.detectFace(bitmap)
 
+            val detection = tfliteEngine.detectFace(bitmap)
             if (detection == null) {
-                emitFrameData("no_face", null, null, null)
+                Log.d(TAG, "No face detected")
+                emitFrameData("no_face", null, null, null, null, null, null)
                 return
             }
+
+            // Only check confidence — BlazeFace keypoint validation handles geometry
+            if (detection.confidence < 0.5f) {
+                Log.d(TAG, "Face rejected: low confidence ${detection.confidence}")
+                emitFrameData("no_face", null, null, null, null, null, null)
+                return
+            }
+
+            Log.d(TAG, "Face detected: confidence=${detection.confidence}")
 
             val landmarks = tfliteEngine.getLandmarks(bitmap, detection)
             if (landmarks == null) {
-                emitFrameData("face_detected", null, null, null)
+                Log.w(TAG, "Face detected but landmarks returned null")
+                emitFrameData("face_detected", null, null, null, null, null, null)
                 return
             }
+
+            Log.d(TAG, "Landmarks detected: ${landmarks.points.size} points")
 
             val faceMeshLiveness = FaceMeshLiveness()
             val ear = faceMeshLiveness.computeEAR(landmarks)
@@ -103,25 +158,22 @@ class LivenessCameraManager(
             val yaw = computeYaw(landmarks)
 
             addEarToHistory(ear)
-
             val blinkDetected = detectBlink()
 
-            val params = Arguments.createMap().apply {
-                putString("status", "landmarks_detected")
-                putDouble("ear", ear.toDouble())
-                putDouble("mar", mar.toDouble())
-                putDouble("yaw", yaw.toDouble())
-                putBoolean("blinkDetected", blinkDetected)
-                putDouble("faceX", detection.bbox.centerX().toDouble())
-                putDouble("faceY", detection.bbox.centerY().toDouble())
-                putDouble("faceWidth", detection.bbox.width().toDouble())
-                putDouble("faceHeight", detection.bbox.height().toDouble())
-            }
+            Log.d(TAG, "Metrics: EAR=$ear, MAR=$mar, Yaw=$yaw, Blink=$blinkDetected")
 
-            onFrameData(params)
+            emitFrameData(
+                "landmarks_detected",
+                ear,
+                mar,
+                yaw,
+                blinkDetected,
+                detection.confidence,
+                detection.bbox.width() / bitmap.width.toFloat()
+            )
 
         } catch (e: Exception) {
-            Log.e(TAG, "Frame processing error: ${e.message}")
+            Log.e(TAG, "Frame processing error: ${e.message}", e)
         } finally {
             imageProxy.close()
         }
@@ -140,14 +192,11 @@ class LivenessCameraManager(
 
     private fun detectBlink(): Boolean {
         if (earHistory.size < 5) return false
-
-        // Pattern: open → closed → open
         for (i in 2 until earHistory.size - 1) {
             val before = earHistory[i - 2]
             val current = earHistory[i]
             val after = earHistory[i + 1]
-
-            if (before > 0.25 && current < 0.2 && after > 0.25) {
+            if (before > 0.22f && current < 0.18f && after > 0.22f) {
                 earHistory.clear()
                 return true
             }
@@ -156,15 +205,27 @@ class LivenessCameraManager(
     }
 
     private fun computeMAR(landmarks: FaceMeshLiveness.Landmarks): Float {
-        val height = distance(landmarks.points[13], landmarks.points[14])
-        val width = distance(landmarks.points[61], landmarks.points[291])
-        return if (width > 0) height / width else 0f
+        val pts = landmarks.points
+        if (pts.size <= 291) {
+            Log.w(TAG, "Not enough landmarks for MAR: ${pts.size}")
+            return 0f
+        }
+        val height = distance(pts[13], pts[14])
+        val width = distance(pts[61], pts[291])
+        val mar = if (width > 0.001f) height / width else 0f
+        Log.d(TAG, "MAR computed: $mar (height=$height, width=$width)")
+        return mar
     }
 
     private fun computeYaw(landmarks: FaceMeshLiveness.Landmarks): Float {
-        val noseTip = landmarks.points[1]
-        val leftEar = landmarks.points[234]
-        val rightEar = landmarks.points[454]
+        val pts = landmarks.points
+        if (pts.size <= 454) {
+            Log.w(TAG, "Not enough landmarks for Yaw: ${pts.size}")
+            return 0f
+        }
+        val noseTip = pts[1]
+        val leftEar = pts[234]
+        val rightEar = pts[454]
         val centerX = (leftEar.x + rightEar.x) / 2f
         return noseTip.x - centerX
     }
@@ -175,18 +236,24 @@ class LivenessCameraManager(
         return kotlin.math.sqrt(dx * dx + dy * dy)
     }
 
-    private fun emitFrameData(status: String, ear: Float?, mar: Float?, yaw: Float?) {
+    private fun emitFrameData(status: String, ear: Float?, mar: Float?, yaw: Float?, blink: Boolean?, faceScore: Float?, faceWidth: Float?) {
         val params = Arguments.createMap().apply {
             putString("status", status)
             ear?.let { putDouble("ear", it.toDouble()) }
             mar?.let { putDouble("mar", it.toDouble()) }
             yaw?.let { putDouble("yaw", it.toDouble()) }
+            blink?.let { putBoolean("blinkDetected", it) }
+            faceScore?.let { putDouble("faceScore", it.toDouble()) }
+            faceWidth?.let { putDouble("faceWidth", it.toDouble()) }
         }
         onFrameData(params)
     }
 
-    // FIXED: Proper YUV to Bitmap conversion
     private fun ImageProxy.toBitmap(): Bitmap {
+        val image = this.image ?: throw IllegalStateException("ImageProxy has no image")
+        val planes = image.planes
+        if (planes.size < 3) throw IllegalStateException("Expected 3 planes, got ${planes.size}")
+
         val yBuffer = planes[0].buffer
         val uBuffer = planes[1].buffer
         val vBuffer = planes[2].buffer
@@ -197,7 +264,6 @@ class LivenessCameraManager(
 
         val nv21 = ByteArray(ySize + uSize + vSize)
 
-        // U and V are swapped
         yBuffer.get(nv21, 0, ySize)
         vBuffer.get(nv21, ySize, vSize)
         uBuffer.get(nv21, ySize + vSize, uSize)
@@ -206,16 +272,37 @@ class LivenessCameraManager(
         val out = ByteArrayOutputStream()
         yuvImage.compressToJpeg(Rect(0, 0, width, height), 100, out)
         val imageBytes = out.toByteArray()
-        
+
         return BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
             ?: throw IllegalStateException("Failed to decode YUV to Bitmap")
     }
 
     fun stop() {
+        if (isStopped) {
+            Log.w(TAG, "stop() called but already stopped")
+            return
+        }
+        isStopped = true
         isRunning.set(false)
         imageAnalysis?.clearAnalyzer()
-        cameraProvider?.unbindAll()
-        analysisExecutor.shutdown()
+
+        try {
+            cameraProvider?.unbindAll()
+        } catch (e: Exception) {
+            Log.w(TAG, "unbindAll failed: ${e.message}")
+        }
+
+        try {
+            if (!analysisExecutor.isShutdown) {
+                analysisExecutor.shutdown()
+                if (!analysisExecutor.awaitTermination(500, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+                    analysisExecutor.shutdownNow()
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Executor shutdown failed: ${e.message}")
+        }
+
         earHistory.clear()
         currentFrameBitmap?.recycle()
         currentFrameBitmap = null

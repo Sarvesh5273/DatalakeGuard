@@ -15,7 +15,6 @@ class BlazeFaceDetector {
     companion object {
         private const val TAG = "BlazeFaceDetector"
         private const val INPUT_SIZE = 128
-        private const val NUM_ANCHORS = 896
         private const val NUM_COORDS = 16
         private const val NUM_KEYPOINTS = 6
     }
@@ -27,25 +26,33 @@ class BlazeFaceDetector {
         val keypoints: List<Keypoint>
     )
 
-    private val anchors: Array<FloatArray> by lazy { generateAnchors() }
+    private var numAnchors: Int = 0
+    private var anchors: Array<FloatArray> = emptyArray()
 
     fun detect(bitmap: Bitmap, interpreter: Interpreter): FaceDetection? {
         try {
-            Log.d(TAG, "detect on ${bitmap.width}x${bitmap.height}")
+            if (numAnchors == 0) {
+                inspectModel(interpreter)
+            }
+
+            Log.d(TAG, "detect on ${bitmap.width}x${bitmap.height}, anchors=$numAnchors")
+
             for (pass in 0..1) {
                 val input = preprocess(bitmap, useBgr = (pass == 1))
-                // 3D shapes [1, 896, 16] and [1, 896, 1] to match model output
-                val reg: Array<Array<FloatArray>> = Array(1) { Array(NUM_ANCHORS) { FloatArray(NUM_COORDS) } }
-                val cls: Array<Array<FloatArray>> = Array(1) { Array(NUM_ANCHORS) { FloatArray(1) } }
+                val reg: Array<Array<FloatArray>> = Array(1) { Array(numAnchors) { FloatArray(NUM_COORDS) } }
+                val cls: Array<Array<FloatArray>> = Array(1) { Array(numAnchors) { FloatArray(1) } }
                 val outputMap = HashMap<Int, Any>()
                 outputMap[0] = reg
                 outputMap[1] = cls
                 interpreter.runForMultipleInputsOutputs(arrayOf(input), outputMap)
+
                 val topRaw = cls[0].maxOf { it[0] }
                 val maxSigmoid = 1f / (1f + exp(-topRaw))
                 Log.d(TAG, "pass=$pass cls.maxRaw=$topRaw cls.maxSigmoid=$maxSigmoid")
+
                 val decoded = decode(reg[0], cls[0])
                 Log.d(TAG, "pass=$pass raw=${decoded.size}")
+
                 if (decoded.isNotEmpty()) {
                     val best = decoded.first()
                     Log.d(TAG, "pass=$pass best.conf=${best.confidence}")
@@ -57,6 +64,25 @@ class BlazeFaceDetector {
             Log.e(TAG, "detect error: ${e.message}", e)
             return null
         }
+    }
+
+    private fun inspectModel(interpreter: Interpreter) {
+        val inputTensor = interpreter.getInputTensor(0)
+        val outputTensor0 = interpreter.getOutputTensor(0)
+        val outputTensor1 = interpreter.getOutputTensor(1)
+
+        Log.i(TAG, "Model inspection:")
+        Log.i(TAG, "Input: ${inputTensor.shape().contentToString()}")
+        Log.i(TAG, "Output0: ${outputTensor0.shape().contentToString()}")
+        Log.i(TAG, "Output1: ${outputTensor1.shape().contentToString()}")
+
+        val shape0 = outputTensor0.shape()
+        val shape1 = outputTensor1.shape()
+
+        numAnchors = if (shape0[2] == NUM_COORDS) shape0[1] else shape1[1]
+        Log.i(TAG, "Num anchors: $numAnchors")
+
+        anchors = generateAnchors(numAnchors)
     }
 
     private fun preprocess(bitmap: Bitmap, useBgr: Boolean): ByteBuffer {
@@ -76,24 +102,36 @@ class BlazeFaceDetector {
         return buf
     }
 
-    private fun generateAnchors(): Array<FloatArray> {
-        val list = ArrayList<FloatArray>(NUM_ANCHORS)
-        for (y in 0 until 16) for (x in 0 until 16) {
-            val cx = (x + 0.5f) / 16f
-            val cy = (y + 0.5f) / 16f
-            list.add(floatArrayOf(cx, cy, 0.10f, 0.10f))
-            list.add(floatArrayOf(cx, cy, 0.20f, 0.20f))
+    private fun generateAnchors(count: Int): Array<FloatArray> {
+        val list = ArrayList<FloatArray>(count)
+        val strides = intArrayOf(8, 16, 32, 64, 128)
+        val sizesPerStride = arrayOf(
+            floatArrayOf(0.10f, 0.18f),
+            floatArrayOf(0.30f, 0.45f),
+            floatArrayOf(0.60f, 0.75f),
+            floatArrayOf(0.90f, 1.05f),
+            floatArrayOf(1.20f, 1.35f)
+        )
+
+        for ((si, stride) in strides.withIndex()) {
+            val grid = INPUT_SIZE / stride
+            val sizes = sizesPerStride.getOrElse(si) { floatArrayOf(0.1f, 0.2f) }
+            for (y in 0 until grid) {
+                for (x in 0 until grid) {
+                    val cx = (x + 0.5f) / grid.toFloat()
+                    val cy = (y + 0.5f) / grid.toFloat()
+                    for (s in sizes) {
+                        list.add(floatArrayOf(cx, cy, s, s))
+                        if (list.size >= count) return list.toTypedArray()
+                    }
+                }
+            }
         }
-        for (y in 0 until 8) for (x in 0 until 8) {
-            val cx = (x + 0.5f) / 8f
-            val cy = (y + 0.5f) / 8f
-            list.add(floatArrayOf(cx, cy, 0.30f, 0.45f))
-            list.add(floatArrayOf(cx, cy, 0.45f, 0.60f))
-            list.add(floatArrayOf(cx, cy, 0.60f, 0.75f))
-            list.add(floatArrayOf(cx, cy, 0.75f, 0.90f))
-            list.add(floatArrayOf(cx, cy, 0.90f, 1.05f))
-            list.add(floatArrayOf(cx, cy, 1.05f, 1.20f))
+
+        while (list.size < count) {
+            list.add(floatArrayOf(0.5f, 0.5f, 0.1f, 0.1f))
         }
+
         return list.toTypedArray()
     }
 
@@ -103,7 +141,7 @@ class BlazeFaceDetector {
     ): List<FaceDetection> {
         val scoreThreshold = 0.30f
         val results = ArrayList<FaceDetection>()
-        for (i in 0 until NUM_ANCHORS) {
+        for (i in 0 until numAnchors) {
             val rawScore = classifiers[i][0]
             val score = 1f / (1f + exp(-rawScore))
             if (score < scoreThreshold) continue
@@ -116,8 +154,8 @@ class BlazeFaceDetector {
             val dh = r[3]
             val cx = a[0] + dx * 0.1f
             val cy = a[1] + dy * 0.1f
-            val w = a[2] * Math.exp(dw.toDouble()).toFloat()
-            val h = a[3] * Math.exp(dh.toDouble()).toFloat()
+            val w = a[2] * kotlin.math.exp(dw.toDouble()).toFloat()
+            val h = a[3] * kotlin.math.exp(dh.toDouble()).toFloat()
 
             val left = max(0f, cx - w / 2f)
             val top = max(0f, cy - h / 2f)
