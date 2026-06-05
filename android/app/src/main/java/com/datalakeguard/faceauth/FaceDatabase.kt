@@ -16,7 +16,7 @@ class FaceDatabase(context: Context) : SQLiteOpenHelper(
     companion object {
         private const val TAG = "FaceAuthDB"
         private const val DATABASE_NAME = "face_auth.db"
-        private const val DATABASE_VERSION = 1
+        private const val DATABASE_VERSION = 3
         private const val PASSWORD = "DatalakeGuard_AES256_Secure_Key_2026"
         
         private const val TABLE_EMBEDDINGS = "embeddings"
@@ -277,12 +277,14 @@ class FaceDatabase(context: Context) : SQLiteOpenHelper(
     fun getPendingSyncCount(): Pair<Int, Int> {
         val db = getReadableDb()
         
-        val embCursor = db.rawQuery("SELECT COUNT(*) FROM $TABLE_EMBEDDINGS WHERE synced = 0", null)
+        // Count pending embeddings in sync_queue
+        val embCursor = db.rawQuery("SELECT COUNT(*) FROM $TABLE_SYNC_QUEUE WHERE payload_type = 'embedding'", null)
         embCursor.moveToFirst()
         val pendingEmbeddings = embCursor.getInt(0)
         embCursor.close()
         
-        val logCursor = db.rawQuery("SELECT COUNT(*) FROM $TABLE_AUTH_LOGS WHERE synced = 0", null)
+        // Count pending auth logs in sync_queue
+        val logCursor = db.rawQuery("SELECT COUNT(*) FROM $TABLE_SYNC_QUEUE WHERE payload_type = 'auth_log'", null)
         logCursor.moveToFirst()
         val pendingLogs = logCursor.getInt(0)
         logCursor.close()
@@ -296,7 +298,6 @@ class FaceDatabase(context: Context) : SQLiteOpenHelper(
         db.delete(TABLE_EMBEDDINGS, null, null)
         db.delete(TABLE_AUTH_LOGS, null, null)
         db.delete(TABLE_SYNC_QUEUE, null, null)
-        db.close()
     }
     
     data class EmbeddingRecord(

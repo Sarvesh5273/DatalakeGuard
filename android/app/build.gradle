@@ -81,6 +81,9 @@ android {
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 1
         versionName "1.0"
+        buildConfigField "String", "AWS_ACCESS_KEY", "\"${project.findProperty('AWS_ACCESS_KEY') ?: ''}\""
+        buildConfigField "String", "AWS_SECRET_KEY", "\"${project.findProperty('AWS_SECRET_KEY') ?: ''}\""
+
         
         ndk {
             abiFilters "armeabi-v7a", "arm64-v8a"

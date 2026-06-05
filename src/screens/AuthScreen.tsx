@@ -14,10 +14,11 @@ import {
   ActivityIndicator,
   Linking,
 } from 'react-native';
+
 import {startAuthentication, processLivenessFrameForMatching} from '../modules/faceAuth';
 import {getPendingSyncCount, syncToAWS} from '../modules/faceAuthSync';
 
-const {FaceAuthModule} = NativeModules;
+const {FaceAuthModule, AuthSyncModule} = NativeModules;
 const livenessEmitter = new NativeEventEmitter(FaceAuthModule);
 
 const CameraPreviewView = Platform.OS === 'android' ? requireNativeComponent<{style: any}>('CameraPreviewView') : null;
@@ -168,6 +169,18 @@ export default function AuthScreen() {
       console.log('performFaceMatching: native returned', result);
 
       if (result?.status === 'complete') {
+        // Queue auth log from JS side (bypasses native queue bug)
+        try {
+          await AuthSyncModule.logAuthEvent(
+            result.workerId || 'unknown',
+            result.confidence || 0,
+            result.livenessPass || false,
+          );
+          console.log('JS: Auth log queued successfully');
+        } catch (e) {
+          console.log('JS: Auth log queue failed', e);
+        }
+
         if (result.matched) {
           cleanup();
           Alert.alert(
