@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.util.Log
 import org.tensorflow.lite.Interpreter
+import org.tensorflow.lite.nnapi.NnApiDelegate
 import org.tensorflow.lite.support.common.FileUtil
 import java.nio.MappedByteBuffer
 
@@ -27,9 +28,31 @@ class TFLiteEngine(private val context: Context) {
     
     private fun loadModels() {
         try {
+            // BlazeFace: small model, CPU is fine
             blazeFaceInterpreter = Interpreter(loadModelFile("blazeface_short_range.tflite"))
-            faceMeshInterpreter = Interpreter(loadModelFile("face_landmark.tflite"))
-            mobileFaceNetInterpreter = Interpreter(loadModelFile("mobilefacenet.tflite"))
+            
+            // FaceMesh: medium model, use NNAPI for speed
+            val faceMeshOptions = Interpreter.Options().apply {
+                addDelegate(NnApiDelegate())
+                setNumThreads(4)
+            }
+            faceMeshInterpreter = Interpreter(loadModelFile("face_landmark.tflite"), faceMeshOptions)
+            
+            // MobileFaceNet: heaviest model, NNAPI + INT8 for <1s target
+            // Try INT8 first, fall back to FP32 if not found
+            val mobileFaceNetOptions = Interpreter.Options().apply {
+                addDelegate(NnApiDelegate())
+                setNumThreads(4)
+            }
+            
+            val int8Model = tryLoadModel("mobilefacenet_int8.tflite")
+            mobileFaceNetInterpreter = if (int8Model != null) {
+                Log.i(TAG, "Using INT8 quantized MobileFaceNet")
+                Interpreter(int8Model, mobileFaceNetOptions)
+            } else {
+                Log.i(TAG, "INT8 model not found, using FP32 MobileFaceNet")
+                Interpreter(loadModelFile("mobilefacenet.tflite"), mobileFaceNetOptions)
+            }
             
             // LOG ACTUAL OUTPUT SHAPES
             blazeFaceInterpreter?.let { interp ->
@@ -52,6 +75,15 @@ class TFLiteEngine(private val context: Context) {
     
     private fun loadModelFile(modelName: String): MappedByteBuffer {
         return FileUtil.loadMappedFile(context, "models/$modelName")
+    }
+    
+    private fun tryLoadModel(modelName: String): MappedByteBuffer? {
+        return try {
+            FileUtil.loadMappedFile(context, "models/$modelName")
+        } catch (e: Exception) {
+            Log.w(TAG, "Model $modelName not found: ${e.message}")
+            null
+        }
     }
     
     fun detectFace(bitmap: Bitmap): BlazeFaceDetector.FaceDetection? {

@@ -11,6 +11,7 @@ import com.facebook.react.defaults.DefaultReactHost.getDefaultReactHost
 import com.facebook.react.defaults.DefaultReactNativeHost
 import com.facebook.soloader.SoLoader
 import com.datalakeguard.faceauth.FaceAuthPackage
+import com.datalakeguard.faceauth.AuthSyncPackage
 
 class MainApplication : Application(), ReactApplication {
 
@@ -19,6 +20,7 @@ class MainApplication : Application(), ReactApplication {
         override fun getPackages(): List<ReactPackage> =
             PackageList(this).packages.apply {
               add(FaceAuthPackage())
+              add(AuthSyncPackage())
             }
 
         override fun getJSMainModuleName(): String = "index"
